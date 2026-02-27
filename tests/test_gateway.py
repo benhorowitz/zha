@@ -1356,3 +1356,180 @@ async def test_device_availability_checker_start_twice_stop_once_cancels_all_tas
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_shutdown_duplicate_call_short_circuits_cleanup(
+    zha_data: ZHAData,
+) -> None:
+    """Test duplicate shutdown calls exit early without cleanup side effects."""
+    gateway = Gateway(zha_data)
+    updater_stop = patch.object(
+        gateway.global_updater,
+        "stop",
+        wraps=gateway.global_updater.stop,
+    )
+    availability_stop = patch.object(
+        gateway._device_availability_checker,
+        "stop",
+        wraps=gateway._device_availability_checker.stop,
+    )
+
+    # Issue being validated:
+    # shutdown() should immediately return when `shutting_down` is already True.
+    #
+    # Why this is a problem:
+    # Without a hard short-circuit, duplicate shutdown calls can race through
+    # teardown and repeatedly manipulate lifecycle-managed resources.
+    with updater_stop as updater_stop_mock, availability_stop as availability_stop_mock:
+        gateway.shutting_down = True
+        await gateway.shutdown()
+
+    assert updater_stop_mock.call_count == 0
+    assert availability_stop_mock.call_count == 0
+    assert gateway.shutting_down is True
+
+
+async def test_find_coordinator_device_prefers_backup_ieee_when_available(
+    zha_data: ZHAData,
+) -> None:
+    """Test coordinator lookup uses backup IEEE when a backup exists."""
+    gateway = Gateway(zha_data)
+    primary_coordinator = MagicMock()
+    backup_coordinator = MagicMock()
+    backup = MagicMock()
+    backup.node_info.ieee = zigpy.types.EUI64.convert("00:11:22:33:44:55:66:77")
+
+    gateway.application_controller = MagicMock()
+    gateway.application_controller.backups.most_recent_backup.return_value = backup
+    gateway.application_controller.get_device.side_effect = [
+        primary_coordinator,
+        backup_coordinator,
+    ]
+
+    # Issue being validated:
+    # _find_coordinator_device() should attempt a second lookup by backup IEEE when
+    # backup metadata exists, rather than relying only on nwk=0x0000.
+    #
+    # Why this is a problem:
+    # After restores/reforms, nwk-based lookup can point at stale coordinator state;
+    # skipping IEEE recovery can bind gateway coordinator logic to the wrong device.
+    resolved = gateway._find_coordinator_device()
+
+    assert resolved is backup_coordinator
+    assert gateway.application_controller.get_device.call_args_list == [
+        call(nwk=0x0000),
+        call(ieee=backup.node_info.ieee),
+    ]
+
+
+async def test_load_devices_handles_last_seen_delta_branch(
+    zha_data: ZHAData,
+) -> None:
+    """Test load_devices executes last-seen delta logic for known devices."""
+    gateway = Gateway(zha_data)
+    zigpy_device = MagicMock()
+    gateway.application_controller = MagicMock()
+    gateway.application_controller.devices = {zigpy_device.ieee: zigpy_device}
+
+    restored_device = MagicMock()
+    restored_device.last_seen = 100.0
+    restored_device.nwk = 0x1234
+    restored_device.name = "test-device"
+    restored_device.available = True
+    restored_device.consider_unavailable_time = 120
+    restored_device.async_initialize = AsyncMock()
+
+    # Issue being validated:
+    # load_devices() has a branch that computes elapsed time since last_seen for
+    # restored devices.
+    #
+    # Why this is a problem:
+    # Startup diagnostics and availability reasoning rely on this path; if untested,
+    # regressions can silently degrade restore-time observability.
+    with (
+        patch.object(gateway, "get_or_create_device", return_value=restored_device),
+        patch("zha.application.gateway.time.time", return_value=130.0),
+    ):
+        await gateway.load_devices()
+
+    restored_device.async_initialize.assert_awaited_once_with(from_cache=True)
+
+
+async def test_load_groups_adds_discovered_entities(zha_data: ZHAData) -> None:
+    """Test load_groups adds discovered group entities."""
+    gateway = Gateway(zha_data)
+    zigpy_group = MagicMock()
+    zha_group = MagicMock()
+    discovered_group_entity = MagicMock()
+
+    gateway.application_controller = MagicMock()
+    gateway.application_controller.groups = {0x1001: zigpy_group}
+
+    # Issue being validated:
+    # load_groups() should call on_add() for entities discovered on restored groups.
+    #
+    # Why this is a problem:
+    # If discovered entities are not added during group restoration, group-backed
+    # functionality comes up partially initialized after startup/reload cycles.
+    with (
+        patch.object(gateway, "get_or_create_group", return_value=zha_group),
+        patch(
+            "zha.application.gateway.discovery.discover_group_entities",
+            return_value=[discovered_group_entity],
+        ),
+    ):
+        gateway.load_groups()
+
+    discovered_group_entity.on_add.assert_called_once_with()
+
+
+async def test_group_maybe_update_group_members_awaits_pollable_entities(
+    zha_gateway: Gateway,
+) -> None:
+    """Test group member updates await pollable entity refresh tasks."""
+    zha_group = await _create_group_with_two_members(zha_gateway)
+    pollable_entity = MagicMock()
+    pollable_entity.should_poll = True
+    pollable_entity.async_update = AsyncMock()
+    event = MagicMock(platform=Platform.LIGHT)
+
+    # Issue being validated:
+    # _maybe_update_group_members() should aggregate async_update() tasks for member
+    # entities that are marked should_poll.
+    #
+    # Why this is a problem:
+    # If pollable members are skipped, group state drifts stale and composite group
+    # entity behavior diverges from actual member state over time.
+    with patch.object(
+        zha_group, "get_platform_entities", return_value=[pollable_entity]
+    ):
+        await zha_group._maybe_update_group_members(event)
+
+    pollable_entity.async_update.assert_awaited_once_with()
+
+
+async def test_async_from_config_registers_unbuilt_v2_quirks(
+    zha_data: ZHAData,
+) -> None:
+    """Test async_from_config registers unbuilt v2 quirks before setup."""
+    zha_data.config.quirks_configuration.enabled = True
+    unregistered_quirk = MagicMock()
+    unregistered_quirk.manufacturer_model_metadata = [("Test", "Model")]
+
+    # Issue being validated:
+    # async_from_config() should detect builders left in UNBUILT_QUIRK_BUILDERS and
+    # explicitly register builders that include manufacturer/model metadata.
+    #
+    # Why this is a problem:
+    # If these builders are not registered, matching quirks never activate and
+    # affected devices run with incomplete or incorrect runtime behavior.
+    with (
+        patch(
+            "zha.application.gateway.UNBUILT_QUIRK_BUILDERS",
+            [unregistered_quirk],
+        ),
+        patch("zha.application.gateway.setup_quirks"),
+    ):
+        await Gateway.async_from_config(zha_data)
+
+    unregistered_quirk.add_to_registry.assert_called_once_with()
