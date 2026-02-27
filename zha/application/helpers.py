@@ -412,6 +412,11 @@ class GlobalUpdater:
 
     def start(self):
         """Start the global updater."""
+        if self._updater_task_handle and not (
+            self._updater_task_handle.done() or self._updater_task_handle.cancelled()
+        ):
+            return
+
         self._updater_task_handle = self._gateway.async_create_background_task(
             self.update_listeners(),
             name=f"global-updater_{self.__class__.__name__}",
@@ -477,6 +482,12 @@ class DeviceAvailabilityChecker:
 
     def start(self):
         """Start the device availability checker."""
+        if self._device_availability_task_handle and not (
+            self._device_availability_task_handle.done()
+            or self._device_availability_task_handle.cancelled()
+        ):
+            return
+
         self._device_availability_task_handle = (
             self._gateway.async_create_background_task(
                 self.check_device_availability(),

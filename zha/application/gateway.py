@@ -198,7 +198,9 @@ class Gateway(AsyncUtilMixin, EventBase):
 
     def get_application_controller_data(self) -> tuple[ControllerApplication, dict]:
         """Get an uninitialized instance of a zigpy `ControllerApplication`."""
-        app_config = self.config.zigpy_config
+        app_config = dict(self.config.zigpy_config)
+        if CONF_NWK in app_config:
+            app_config[CONF_NWK] = dict(app_config[CONF_NWK])
         app_config[CONF_DEVICE] = {
             CONF_DEVICE_PATH: self.config.config.coordinator_configuration.path,
             CONF_DEVICE_BAUDRATE: self.config.config.coordinator_configuration.baudrate,
@@ -380,13 +382,17 @@ class Gateway(AsyncUtilMixin, EventBase):
 
         async def fetch_updated_state() -> None:
             """Fetch updated state for mains powered devices."""
-            if self.config.config.device_options.enable_mains_startup_polling:
-                async with self.request_priority(t.PacketPriority.LOW):
-                    await self.async_fetch_updated_state_mains()
-            else:
-                _LOGGER.debug("Polling of mains powered devices at startup is disabled")
-            _LOGGER.debug("Allowing polled requests")
-            self.config.allow_polling = True
+            try:
+                if self.config.config.device_options.enable_mains_startup_polling:
+                    async with self.request_priority(t.PacketPriority.LOW):
+                        await self.async_fetch_updated_state_mains()
+                else:
+                    _LOGGER.debug(
+                        "Polling of mains powered devices at startup is disabled"
+                    )
+            finally:
+                _LOGGER.debug("Allowing polled requests")
+                self.config.allow_polling = True
 
         # background the fetching of state for mains powered devices
         self.async_create_background_task(
@@ -443,7 +449,12 @@ class Gateway(AsyncUtilMixin, EventBase):
             name=f"device_initialized_task_{str(device.ieee)}:0x{device.nwk:04x}",
             eager_start=True,
         )
-        init_task.add_done_callback(lambda _: self._device_init_tasks.pop(device.ieee))
+
+        def _remove_device_init_task(done_task: asyncio.Task) -> None:
+            if self._device_init_tasks.get(device.ieee) is done_task:
+                self._device_init_tasks.pop(device.ieee, None)
+
+        init_task.add_done_callback(_remove_device_init_task)
 
     def device_left(self, device: zigpy.device.Device) -> None:
         """Handle device leaving the network."""
@@ -494,7 +505,13 @@ class Gateway(AsyncUtilMixin, EventBase):
     def group_removed(self, zigpy_group: zigpy.group.Group) -> None:
         """Handle zigpy group removed event."""
         self._emit_group_gateway_message(zigpy_group, ZHA_GW_MSG_GROUP_REMOVED)
-        zha_group = self._groups.pop(zigpy_group.group_id)
+        zha_group = self._groups.pop(zigpy_group.group_id, None)
+        if zha_group is None:
+            _LOGGER.debug(
+                "Received group_removed for unknown group 0x%04x",
+                zigpy_group.group_id,
+            )
+            return
         zha_group.info("group_removed")
 
     def _emit_group_gateway_message(  # pylint: disable=unused-argument
@@ -516,6 +533,10 @@ class Gateway(AsyncUtilMixin, EventBase):
     def device_removed(self, device: zigpy.device.Device) -> None:
         """Handle device being removed from the network."""
         _LOGGER.info("Removing device %s - %s", device.ieee, f"0x{device.nwk:04x}")
+
+        if init_task := self._device_init_tasks.pop(device.ieee, None):
+            init_task.cancel()
+
         zha_device = self._devices.pop(device.ieee, None)
         if zha_device is not None:
             device_info = zha_device.extended_device_info
@@ -739,40 +760,43 @@ class Gateway(AsyncUtilMixin, EventBase):
 
         self.shutting_down = True
 
-        self.global_updater.stop()
-        self._device_availability_checker.stop()
+        try:
+            self.global_updater.stop()
+            self._device_availability_checker.stop()
 
-        for device in self._devices.values():
-            try:
-                await device.on_remove()
-            except Exception:
-                _LOGGER.warning(
-                    "Failed to remove device %s during shutdown",
-                    device,
-                    exc_info=True,
-                )
+            for device in self._devices.values():
+                try:
+                    await device.on_remove()
+                except Exception:
+                    _LOGGER.warning(
+                        "Failed to remove device %s during shutdown",
+                        device,
+                        exc_info=True,
+                    )
 
-        for group in self._groups.values():
-            try:
-                await group.on_remove()
-            except Exception:
-                _LOGGER.warning(
-                    "Failed to remove group %s during shutdown",
-                    group,
-                    exc_info=True,
-                )
+            for group in self._groups.values():
+                try:
+                    await group.on_remove()
+                except Exception:
+                    _LOGGER.warning(
+                        "Failed to remove group %s during shutdown",
+                        group,
+                        exc_info=True,
+                    )
 
-        _LOGGER.debug("Shutting down ZHA ControllerApplication")
-        if self.application_controller is not None:
-            await self.application_controller.shutdown()
-            self.application_controller = None
-            # give bellows thread callback a chance to run
-            await asyncio.sleep(SHUT_DOWN_DELAY_S)
+            _LOGGER.debug("Shutting down ZHA ControllerApplication")
+            if self.application_controller is not None:
+                await self.application_controller.shutdown()
+                self.application_controller = None
+                # give bellows thread callback a chance to run
+                await asyncio.sleep(SHUT_DOWN_DELAY_S)
 
-        await super().shutdown()
+            await super().shutdown()
 
-        self._devices.clear()
-        self._groups.clear()
+            self._devices.clear()
+            self._groups.clear()
+        finally:
+            self.shutting_down = False
 
     def handle_message(  # pylint: disable=unused-argument
         self,

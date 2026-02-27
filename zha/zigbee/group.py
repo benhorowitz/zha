@@ -236,6 +236,7 @@ class Group(LogMixin):
         if group_entity.unique_id in self._group_entities:
             self._group_entities.pop(group_entity.unique_id)
             self._entity_unsubs.pop(group_entity.unique_id)()
+            self.update_entity_subscriptions()
 
     def _handle_maybe_update_group_members(self, event: EntityStateChangedEvent):
         """Handle the maybe update group members event."""
@@ -297,6 +298,9 @@ class Group(LogMixin):
 
     async def async_add_members(self, members: list[GroupMemberReference]) -> None:
         """Add members to this group."""
+        if not members:
+            return
+
         devices: dict[EUI64, Device] = self._gateway.devices
         if len(members) > 1:
             tasks = []
@@ -316,6 +320,9 @@ class Group(LogMixin):
 
     async def async_remove_members(self, members: list[GroupMemberReference]) -> None:
         """Remove members from this group."""
+        if not members:
+            return
+
         devices: dict[EUI64, Device] = self._gateway.devices
         if len(members) > 1:
             tasks = []
